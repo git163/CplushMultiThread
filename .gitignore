@@ -1,0 +1,31 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Build
+build/
+build-*/
+out/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Coverage
+*.gcov
+*.gcda
+*.gcno
+coverage/
+*.info

@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(find *)",
+      "Bash(tree *)",
+      "Bash(grep *)",
+      "Bash(mkdir *)",
+      "Bash(touch *)",
+      "Bash(cmake -S . -B build*)",
+      "Bash(cmake --build build*)",
+      "Bash(ctest --test-dir build*)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git branch *)",
+      "Bash(git remote -v *)",
+      "Bash(git fetch *)",
+      "Bash(git pull *)",
+      "Bash(gdb *)",
+      "Bash(lldb *)",
+      "Bash(clang-format *)",
+      "Bash(clang-tidy *)",
+      "Bash(clang++ *)",
+      "Bash(cppcheck *)",
+      "Bash(code .)"
+    ]
+  }
+}
