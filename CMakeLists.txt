@@ -16,6 +16,15 @@ endif()
 # 调试信息：所有 build type 都保留 -g，便于事后排查
 add_compile_options(-g)
 
+# 多线程竞争检测（ThreadSanitizer）：cmake -S . -B build-tsan -DENABLE_TSAN=ON
+# 说明见 docs/data_race_detection.md §2.2。全局生效，主程序/测试/示例都会带上。
+# 注意：TSan 产物只用于检测，运行时开销 2~5 倍，不要进发布版本。
+option(ENABLE_TSAN "Build with ThreadSanitizer" OFF)
+if(ENABLE_TSAN)
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -O1)
+    add_link_options(-fsanitize=thread)
+endif()
+
 # 源码与头文件
 # 注意：file(GLOB_RECURSE) 是 CMake 反模式——CMake 不会主动感知新增的 .cpp。
 # 缓解：CONFIGURE_DEPENDS 会在 build 时触发 cmake 重跑；如 build 已存在，
@@ -42,4 +51,10 @@ option(BUILD_TESTING "Build unit tests" ON)
 if(BUILD_TESTING)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# 场景示例（examples/）：每个 .cpp 一个可独立运行的程序
+option(BUILD_EXAMPLES "Build examples" ON)
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples)
 endif()

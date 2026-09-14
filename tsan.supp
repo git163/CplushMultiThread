@@ -1,0 +1,33 @@
+# ThreadSanitizer 抑制文件（TSan suppression）
+#
+# 用法（**务必用绝对路径**）：
+#   TSAN_OPTIONS=suppressions=$PWD/tsan.supp ./build-tsan/examples/sync_task
+#   TSAN_OPTIONS=suppressions=$PWD/tsan.supp ctest --test-dir build-tsan --output-on-failure
+#
+# 为什么必须绝对路径：ctest 是在**每个测试自己的目录**下运行测试的（如 build-tsan/tests/），
+# 相对路径会解析到那里而找不到文件；此时 TSan 会直接
+#   ThreadSanitizer: failed to read suppressions file '...'
+# 并让测试全部失败（不是忽略，是失败）。
+#
+# 详细说明见 docs/data_race_detection.md。
+
+# ---- libc++ 的 std::cout 多线程误报 ----
+#
+# 现象：多个线程各自 std::cout << ... << std::endl（**没有任何共享数据**）会报
+#   WARNING: ThreadSanitizer: data race
+#     ... Location is global 'std::__1::cout' at 0x... (libc++.dylib+...)
+# 栈顶帧是下面两个函数之一 —— 都在 libc++ 内部，不涉及用户数据：
+#   - __pad_and_output          ：填充字符（fill/pad）的惰性缓存
+#   - __put_character_sequence  ：写入时对该缓存的读写
+# 标准保证「对同步（sync_with_stdio 未关闭）的标准 iostream 对象的并发访问
+# 不是数据竞争」，故这是 TSan 看不到 libc++ 内部同步而导致的误报。
+#
+# 最小复现（无任何共享数据，仍会报）：
+#   std::thread a([]{ for (int i=0;i<200;++i) std::cout << "a" << i << std::endl; });
+#   std::thread b([]{ for (int i=0;i<200;++i) std::cout << "b" << i << std::endl; });
+# 规避（二选一）：改用 std::printf；或给输出加锁。
+#
+# 用 race_top 而非 race：只抑制「栈顶帧恰好就是这两个函数」的报告，
+# 栈顶帧落在业务/框架代码里的**真实竞争照常报出**（不会掩盖真问题）。
+race_top:__pad_and_output
+race_top:__put_character_sequence

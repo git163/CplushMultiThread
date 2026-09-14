@@ -30,7 +30,19 @@ cmake --build build-release -j
 ./build/CplushMultiThread
 ```
 
-运行 task_runner 的 sync + async 演示：每秒状态发布、协作式停止、on_stopped 后处理与错误码分支。
+运行 task_runner 的完整演示：场景 1 同步任务 / 场景 2 异步任务 / 场景 3 自然完成 —— 每秒状态发布、协作式停止、`on_finished` 结束回调、`on_stopped` 后处理与错误码分支。
+
+按场景的更小示例见 `examples/`（每个 `.cpp` 一个可独立运行的程序）：
+
+```bash
+./build/examples/sync_task              # 执行/停止按钮
+./build/examples/async_task             # 异步任务两种完成句柄来源
+./build/examples/progress_and_finish    # 进度发布 + 结束收尾
+./build/examples/multi_task             # 多任务并发 vs 全局互斥
+./build/examples/reusable_components    # 组件独立使用
+```
+
+示例说明见 `examples/README.md`，按场景的使用指南见 `docs/task-runner-usage-guide.md`。
 
 ## 测试
 
@@ -58,10 +70,11 @@ lldb ./build/CplushMultiThread           # macOS
 
 ## 项目结构
 
-- `docs/` — 设计文档与 plan（使用 `docs/plan-template.md`）
+- `docs/` — 设计文档、plan 与指南（plan 使用 `docs/plan-template.md`）
 - `src/` — 实现（`.cpp`）
 - `src/include/` — 公共头文件（Google C++ 风格）
-- `src/include/task_runner/` — 可执行/可停止任务框架（仅头文件），使用文档见 `src/include/task_runner/README.md`
+- `src/include/task_runner/` — 可执行/可停止任务框架（仅头文件），API 参考见 `src/include/task_runner/README.md`
+- `examples/` — 按场景的可运行示例（见 `examples/README.md`）
 - `tests/` — GTest 单元测试（`Test*.cpp`）
 
 ## 约定

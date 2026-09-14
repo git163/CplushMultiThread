@@ -13,7 +13,11 @@
 //      任何 join 都发生在 phase 内部，杜绝跨轮次双重 join 与成员写竞态。
 //   2. 停止为协作式：置 stop 标记 + 唤醒 + 等待真正停止。业务不感知则框架一直等其结束。
 //   3. 防重入：running 中 start→already_running；stopping 中 start/stop→already_stopping。
-//   4. 约束（务必遵守）：析构不得与 start()/stop() 并发；回调内不得再调控制器 API。
+//   4. 任务结束回调：worker 收尾时调 task->on_finished(result, exception)。三种结束
+//      （completed/stopped/failed）都触发，每轮恰好一次，跑在 worker 线程上。
+//   5. 自调用防护：在控制器自身线程（worker/发布器）内调 start()/stop() → self_stop_denied，
+//      避免 join 自身（on_finished 内误调 start() 正是这条路径）。
+//   6. 约束（务必遵守）：析构不得与 start()/stop() 并发；回调内不得再调控制器 API。
 
 #include <atomic>
 #include <chrono>
@@ -44,6 +48,7 @@ public:
     }
 
     // 强制停止并 join；不触发 on_stopped 回调；不抛异常。
+    // 注意：worker 收尾的 task->on_finished() **仍会执行**（任务确实结束了）。
     ~task_controller() {
         std::shared_ptr<run_phase> ph;
         {
@@ -79,6 +84,18 @@ public:
             }
             if (state_ == controller_state::stopping) {
                 return error_code::already_stopping;
+            }
+            // 自调用防护：在控制器自身线程（worker / 发布器）内调 start()，下面的
+            // "回收旧 phase"会 join 自身 → 死锁/异常。此处提前拒绝。
+            // （on_finished 回调跑在 worker 线程上，正是本防护要覆盖的误用路径。）
+            if (phase_) {
+                const auto tid = std::this_thread::get_id();
+                if (phase_->worker.joinable() && phase_->worker.get_id() == tid) {
+                    return error_code::self_stop_denied;
+                }
+                if (phase_->publisher && phase_->publisher->thread_id() == tid) {
+                    return error_code::self_stop_denied;
+                }
             }
             // 回收上一轮自然结束的 phase（已结束，join 瞬时）。
             if (phase_) {
@@ -129,6 +146,8 @@ public:
 
     // 停止任务（阻塞）：请求停止 → 等待任务真正停止（join worker）→ 执行 on_stopped。
     // on_stopped 运行在调用 stop() 的线程上。回调抛异常被捕获，不影响返回值。
+    // 注意：worker 收尾时会先在 worker 线程上执行 task->on_finished()，随后本函数才返回，
+    //       故 stop() 返回时 on_finished 保证已执行完毕（on_finished 先于 on_stopped）。
     error_code stop(std::function<void()> on_stopped = {}) {
         std::shared_ptr<run_phase> ph;
         {
@@ -179,6 +198,8 @@ public:
         return error_code::ok;
     }
 
+    // 是否仍在运行。返回 false 蕴含任务已彻底结束：on_finished 已返回、发布器已 join。
+    // （impl 上置 idle 是 worker 收尾的最后一步，见 finalize()。）
     bool running() const noexcept {
         std::lock_guard<std::mutex> lk(mutex_);
         return state_ == controller_state::running;
@@ -202,6 +223,12 @@ public:
         return phase_ ? phase_->tick_exc : nullptr;
     }
 
+    // on_finished 抛出的首个异常（无则空）。不影响 last_run_result()。
+    std::exception_ptr finish_exception() const noexcept {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return phase_ ? phase_->finish_exc : nullptr;
+    }
+
 private:
     enum class controller_state { idle, running, stopping };
 
@@ -218,6 +245,7 @@ private:
         run_result result{run_result::none};
         std::exception_ptr run_exc;
         std::exception_ptr tick_exc;
+        std::exception_ptr finish_exc;
     };
 
     // worker 线程入口。
@@ -243,8 +271,15 @@ private:
         finalize(ph, std::move(exc));
     }
 
-    // 收尾：写结果（first-wins）→ 自然完成时置 idle → 通知并 join 发布器。
+    // 收尾：写结果（first-wins）→ 通知并 join 发布器 → on_finished → 自然完成时置 idle。
+    //
+    // 顺序说明（重要）：把"置 idle"放在 on_finished **之后**，使不变式
+    //   `running() == false` ⟹ 任务已彻底结束（on_finished 已返回、发布器已 join）
+    // 在两种结束路径上都成立。反之若先置 idle，轮询 running() 判结束的调用方
+    // 会与 on_finished 竞争（可能后处理跑在回调之前）。
     void finalize(std::shared_ptr<run_phase> const& ph, std::exception_ptr exc) {
+        run_result final_r = run_result::none;
+        std::exception_ptr run_e;
         {
             std::lock_guard<std::mutex> lk(mutex_);
             if (!ph->run_exc && exc) {
@@ -253,17 +288,41 @@ private:
             const run_result r = ph->run_exc ? run_result::failed
                                  : ph->control->stop_requested() ? run_result::stopped
                                                                  : run_result::completed;
-            if (state_ == controller_state::running) {
-                state_ = controller_state::idle;  // 自然完成；stopping 时由 stop() 收尾
-            }
             if (ph->result == run_result::none) {
                 ph->result = r;  // first-wins
             }
+            final_r = ph->result;  // 锁内取最终值，保证与 last_run_result() 严格一致
+            run_e = ph->run_exc;
         }
         ph->control->request_stop();  // 幂等：通知发布器（及业务 token）本阶段结束
         ph->control->wake_all();
         if (ph->publisher) {
             (void)ph->publisher->stop();  // 由 worker 负责 join 发布器
+        }
+        // 任务结束回调：跑在 worker 线程上，三种结果（completed/stopped/failed）都触发、
+        // 每轮恰好一次。放在 publisher->stop() 之后，确保此后不再有 on_tick 与本回调并发；
+        // 不持锁调用，避免回调内误调控制器 API 时与 mutex_ 互锁。
+        try {
+            ph->task->on_finished(final_r, run_e);
+        } catch (std::exception const& e) {
+            std::fprintf(stderr, "[task_runner] on_finished threw: %s\n", e.what());
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (!ph->finish_exc) {
+                ph->finish_exc = std::current_exception();
+            }
+        } catch (...) {
+            std::fprintf(stderr, "[task_runner] on_finished threw unknown\n");
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (!ph->finish_exc) {
+                ph->finish_exc = std::current_exception();
+            }
+        }
+        // 收尾最后一步：自然完成才置 idle（stopping 时由 stop() 收尾，保持既有握手）。
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (state_ == controller_state::running) {
+                state_ = controller_state::idle;
+            }
         }
     }
 

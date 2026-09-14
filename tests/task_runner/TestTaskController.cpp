@@ -1,8 +1,10 @@
 // tests/task_runner/TestTaskController.cpp
 // 覆盖矩阵 SC-09~28：状态机 / 防重入 / 协作停止 / 自然完成 / 异常 / 周期发布 / 析构 / async 完成句柄 / 复用。
+// 覆盖矩阵 SC-30~38：任务结束回调 on_finished（触发范围 / 线程 / 结果一致性 / 异常隔离）。
 
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <functional>
 #include <future>
 #include <memory>
@@ -30,6 +32,7 @@ public:
     sync_loop_job(int steps, std::chrono::milliseconds step) : steps_(steps), step_(step) {}
 
     void run(stop_token token) override {
+        run_tid_ = std::this_thread::get_id();
         for (int i = 0; i < steps_; ++i) {
             if (token.stop_requested()) {
                 stopped_at_ = i;
@@ -43,10 +46,24 @@ public:
 
     void on_tick() override { ++ticks_; }
 
+    // 记录 on_finished 触发情况（结果 / 异常 / 线程 id），供 SC-30~38 断言。
+    void on_finished(run_result r, std::exception_ptr e) override {
+        finish_result_ = r;
+        finish_has_error_ = (e != nullptr);
+        finish_tid_ = std::this_thread::get_id();
+        finish_count_.fetch_add(1);
+    }
+
     std::atomic<bool> run_returned_{false};
     std::atomic<int> progress_{0};
     std::atomic<int> stopped_at_{-1};
     std::atomic<int> ticks_{0};
+
+    std::atomic<int> finish_count_{0};
+    std::atomic<run_result> finish_result_{run_result::none};
+    std::atomic<bool> finish_has_error_{false};
+    std::atomic<std::thread::id> run_tid_{};
+    std::atomic<std::thread::id> finish_tid_{};
 
 private:
     int steps_;
@@ -68,6 +85,29 @@ private:
 class throwing_job : public runnable_task {
 public:
     void run(stop_token) override { throw std::runtime_error("boom"); }
+
+    void on_finished(run_result r, std::exception_ptr e) override {
+        finish_result_ = r;
+        finish_has_error_ = (e != nullptr);
+        finish_count_.fetch_add(1);
+    }
+
+    std::atomic<int> finish_count_{0};
+    std::atomic<run_result> finish_result_{run_result::none};
+    std::atomic<bool> finish_has_error_{false};
+};
+
+// on_finished 里抛异常（验证被捕获记录、不影响 run_result、控制器仍可复用）。
+class finish_throw_job : public runnable_task {
+public:
+    void run(stop_token) override { std::this_thread::sleep_for(30ms); }
+
+    void on_finished(run_result, std::exception_ptr) override {
+        finish_count_.fetch_add(1);
+        throw std::runtime_error("on_finished boom");
+    }
+
+    std::atomic<int> finish_count_{0};
 };
 
 // 收到停止后才抛异常（验证异常优先于 stopped）。
@@ -144,8 +184,17 @@ public:
 
     std::shared_future<void> async_completion() const override { return fut_; }
 
+    void on_finished(run_result r, std::exception_ptr e) override {
+        finish_result_ = r;
+        finish_has_error_ = (e != nullptr);
+        finish_count_.fetch_add(1);
+    }
+
     std::atomic<int> progress_{0};
     std::atomic<int> stopped_at_{-1};
+    std::atomic<int> finish_count_{0};
+    std::atomic<run_result> finish_result_{run_result::none};
+    std::atomic<bool> finish_has_error_{false};
 
 private:
     int steps_;
@@ -164,8 +213,17 @@ public:
         return done_promise_.get_future().share();
     }
 
+    void on_finished(run_result r, std::exception_ptr e) override {
+        finish_result_ = r;
+        finish_has_error_ = (e != nullptr);
+        finish_count_.fetch_add(1);
+    }
+
     mutable std::promise<void> done_promise_;
     stop_token stopper_;
+    std::atomic<int> finish_count_{0};
+    std::atomic<run_result> finish_result_{run_result::none};
+    std::atomic<bool> finish_has_error_{false};
 };
 
 // 记住上一轮 token，验证旧 token 不影响新一轮。
@@ -468,4 +526,155 @@ TEST(TaskController, StaleTokenDoesNotAffectNext) {  // SC-28 上一轮过期 to
     std::this_thread::sleep_for(40ms);
     EXPECT_TRUE(ctl.running());  // 新 token 未停止，仍在运行
     EXPECT_EQ(ctl.stop(), error_code::ok);
+}
+
+// ===================== 任务结束回调 on_finished（SC-30~38）=====================
+
+TEST(TaskController, FinishFiredOnNaturalComplete) {  // SC-30 自然完成也触发
+    auto job = std::make_shared<sync_loop_job>(5, 15ms);  // ~75ms 自然完成
+    task_controller ctl(job, task_mode::sync, 30ms);
+    EXPECT_EQ(ctl.start(), error_code::ok);
+
+    for (int i = 0; i < 50 && ctl.running(); ++i) {
+        std::this_thread::sleep_for(20ms);
+    }
+    // running()==false 蕴含 on_finished 已返回（置 idle 是 worker 收尾的最后一步）
+    EXPECT_FALSE(ctl.running());
+    EXPECT_EQ(job->finish_count_.load(), 1);
+    EXPECT_EQ(job->finish_result_.load(), run_result::completed);
+    EXPECT_FALSE(job->finish_has_error_.load());
+    EXPECT_EQ(ctl.last_run_result(), run_result::completed);
+}
+
+TEST(TaskController, FinishFiredOnCoopStop) {  // SC-31 停止路径触发，且在 on_stopped 之前
+    auto job = std::make_shared<sync_loop_job>(1000, 20ms);
+    task_controller ctl(job, task_mode::sync, 50ms);
+    EXPECT_EQ(ctl.start(), error_code::ok);
+    std::this_thread::sleep_for(60ms);
+
+    std::atomic<bool> finish_done_before_on_stopped{false};
+    auto r = ctl.stop([&] {
+        // stop() 返回前 worker 已收尾 → 此刻回调必已执行完
+        finish_done_before_on_stopped = (job->finish_count_.load() == 1);
+    });
+    EXPECT_EQ(r, error_code::ok);
+    EXPECT_TRUE(finish_done_before_on_stopped);
+    EXPECT_EQ(job->finish_count_.load(), 1);
+    EXPECT_EQ(job->finish_result_.load(), run_result::stopped);
+    EXPECT_EQ(ctl.last_run_result(), run_result::stopped);  // 与回调看到的一致
+}
+
+TEST(TaskController, FinishFiredOnFailure) {  // SC-32 抛异常 → failed + 异常传给回调
+    auto job = std::make_shared<throwing_job>();
+    task_controller ctl(job);
+    EXPECT_EQ(ctl.start(), error_code::ok);
+
+    for (int i = 0; i < 50 && ctl.running(); ++i) {
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_EQ(job->finish_count_.load(), 1);
+    EXPECT_EQ(job->finish_result_.load(), run_result::failed);
+    EXPECT_TRUE(job->finish_has_error_.load());  // error 非空
+    EXPECT_EQ(ctl.last_run_result(), run_result::failed);
+    EXPECT_NE(ctl.run_exception(), nullptr);
+}
+
+TEST(TaskController, FinishRunsOnWorkerThread) {  // SC-33 跑在 worker 线程，非调用方线程
+    auto job = std::make_shared<sync_loop_job>(5, 10ms);
+    task_controller ctl(job);
+    EXPECT_EQ(ctl.start(), error_code::ok);
+
+    for (int i = 0; i < 50 && ctl.running(); ++i) {
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_EQ(job->finish_count_.load(), 1);
+    EXPECT_EQ(job->finish_tid_.load(), job->run_tid_.load());  // 与 run() 同一线程
+    EXPECT_NE(job->finish_tid_.load(), std::this_thread::get_id());
+}
+
+TEST(TaskController, FinishFiredOnAsyncPath) {  // SC-34 async 路径同样触发
+    // ① 完成句柄自然 ready
+    auto job = std::make_shared<async_loop_job>(5, 15ms);
+    task_controller ctl(job, task_mode::async, 30ms);
+    EXPECT_EQ(ctl.start(), error_code::ok);
+    for (int i = 0; i < 50 && ctl.running(); ++i) {
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_EQ(job->finish_count_.load(), 1);
+    EXPECT_EQ(job->finish_result_.load(), run_result::completed);
+
+    // ② 完成句柄迟迟不 ready：释放前不触发，释放后恰好触发一次
+    auto bjob = std::make_shared<async_blocked_job>();
+    task_controller bctl(bjob, task_mode::async, 30ms);
+    EXPECT_EQ(bctl.start(), error_code::ok);
+    std::this_thread::sleep_for(40ms);
+
+    std::thread st([&] { (void)bctl.stop(); });
+    std::this_thread::sleep_for(80ms);
+    EXPECT_EQ(bjob->finish_count_.load(), 0);  // future 未完成 → 不能提前触发
+    bjob->done_promise_.set_value();
+    st.join();
+    EXPECT_EQ(bjob->finish_count_.load(), 1);
+    EXPECT_EQ(bjob->finish_result_.load(), run_result::stopped);
+}
+
+TEST(TaskController, FinishPerCycleExactlyOnce) {  // SC-35 多轮复用：每轮恰好一次
+    auto job = std::make_shared<sync_loop_job>(1000, 10ms);
+    task_controller ctl(job);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(ctl.start(), error_code::ok);
+        std::this_thread::sleep_for(30ms);
+        EXPECT_EQ(ctl.stop(), error_code::ok);
+        EXPECT_EQ(job->finish_count_.load(), i + 1);  // 每轮 +1，不多不少
+    }
+}
+
+TEST(TaskController, FinishNotFiredWhenStartRejectedOrIdleStop) {  // SC-36 未真正运行 → 不触发
+    auto job = std::make_shared<sync_loop_job>(1000, 20ms);
+    task_controller ctl(job);
+
+    EXPECT_EQ(ctl.stop(), error_code::not_running);  // 空闲 stop
+    EXPECT_EQ(job->finish_count_.load(), 0);
+
+    EXPECT_EQ(ctl.start(), error_code::ok);
+    std::this_thread::sleep_for(30ms);
+    EXPECT_EQ(ctl.start(), error_code::already_running);  // 被拒的 start
+    EXPECT_EQ(job->finish_count_.load(), 0);              // 运行中，尚未结束
+
+    EXPECT_EQ(ctl.stop(), error_code::ok);
+    EXPECT_EQ(job->finish_count_.load(), 1);
+}
+
+TEST(TaskController, FinishExceptionRecordedAndIsolated) {  // SC-37 回调抛异常被隔离
+    auto job = std::make_shared<finish_throw_job>();
+    task_controller ctl(job);
+    EXPECT_EQ(ctl.start(), error_code::ok);
+
+    for (int i = 0; i < 50 && ctl.running(); ++i) {
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_EQ(job->finish_count_.load(), 1);
+    EXPECT_EQ(ctl.last_run_result(), run_result::completed);  // 回调异常不影响结果
+    EXPECT_EQ(ctl.run_exception(), nullptr);
+    EXPECT_NE(ctl.finish_exception(), nullptr);  // 记入 finish_exception
+
+    // 控制器仍可复用（回调再抛一次也不影响）
+    EXPECT_EQ(ctl.start(), error_code::ok);
+    for (int i = 0; i < 50 && ctl.running(); ++i) {
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_EQ(job->finish_count_.load(), 2);
+    EXPECT_NE(ctl.finish_exception(), nullptr);
+}
+
+TEST(TaskController, FinishFiredOnDestructor) {  // SC-38 析构触发的停止也回调
+    auto job = std::make_shared<sync_loop_job>(100000, 5ms);
+    {
+        task_controller ctl(job);
+        EXPECT_EQ(ctl.start(), error_code::ok);
+        std::this_thread::sleep_for(40ms);
+        // 析构：request_stop + join（join 保证 on_finished 已执行完）
+    }
+    EXPECT_EQ(job->finish_count_.load(), 1);
+    EXPECT_EQ(job->finish_result_.load(), run_result::stopped);
 }

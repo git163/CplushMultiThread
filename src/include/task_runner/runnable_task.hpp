@@ -6,7 +6,9 @@
 // - sync ：run() 返回即任务完成。
 // - async：run() 把同段内容发到业务自己的内部线程/执行器跑并快速返回，
 //          业务返回 std::shared_future<void> 完成句柄，框架 wait() 判定真正完成。
+// 可选钩子：on_tick() 周期发布状态；on_finished() 任务结束时收尾（三种结束都触发）。
 
+#include <exception>
 #include <future>
 #include <memory>
 
@@ -23,7 +25,7 @@ enum class error_code {
     already_running,  // 正在执行，禁止重入
     already_stopping, // 正在停止，禁止重入
     not_running,      // 未在运行（如对空闲任务调用 stop）
-    self_stop_denied, // 在任务/tick 线程内调用 stop，避免 join 自身
+    self_stop_denied, // 在控制器自身线程（worker/发布器/结束回调）内调 start/stop，避免 join 自身
     resource_error,   // 线程创建等资源失败
 };
 
@@ -56,6 +58,22 @@ public:
     // 状态发布钩子：每 tick_period（默认 1s）被框架调用一次，用于推当前状态。
     // 注意：与 run()/业务异步并发执行，共享状态需自行线程安全（如 std::atomic）。
     virtual void on_tick() {}
+
+    // 任务结束钩子：本任务真正结束时被框架调用，每轮 start() 恰好一次。
+    // - 触发时机：三种结束都触发 —— 正常完成 completed / 收到停止后结束 stopped /
+    //   run() 抛异常 failed（含 async 路径等完成句柄 ready 之后）。
+    // - 执行线程：框架 worker 线程（在 task_controller::finalize() 内）。
+    //   因 stop() 会 join worker，故 stop() 返回时本回调保证已执行完毕；
+    //   任务**自然完成**（无人调 stop()）时同样会触发，析构触发的停止也会触发。
+    //   框架在回调返回后才置回 idle，故 controller.running()==false 蕴含本回调已返回。
+    // - result 与 task_controller::last_run_result() 一致；
+    //   error 即 task_controller::run_exception()（无异常则空）。
+    // - 抛出的异常被框架捕获，记入 task_controller::finish_exception()，不影响 result。
+    // - 约束：不得在回调内调用控制器 API（见 task_runner/README.md「生命周期与约束」）。
+    virtual void on_finished(run_result result, std::exception_ptr error) {
+        (void)result;
+        (void)error;
+    }
 };
 
 }  // namespace task_runner

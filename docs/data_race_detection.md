@@ -54,6 +54,9 @@ ctest --test-dir build-tsan --output-on-failure
 
 **方式 B：给 CMake 加 `ENABLE_TSAN` 选项**（推荐固化到项目，之后一键开关）
 
+> ✅ **本仓已落地**（`CMakeLists.txt`，2026-09-14）。直接按下文用 `-DENABLE_TSAN=ON` 即可。
+> 方式 A 保留作为"不想改项目文件时"的临时手段。
+
 在 `CMakeLists.txt` 的 `add_compile_options(-g)` 之后加：
 
 ```cmake
@@ -69,11 +72,14 @@ endif()
 
 ```bash
 cmake -S . -B build-tsan -DENABLE_TSAN=ON
-cmake --build build-tsan
+cmake --build build-tsan -j
 ctest --test-dir build-tsan --output-on-failure
+
+# 示例程序也一起带上 TSan 了；配合抑制文件跑（注意绝对路径，见 2.4 的 libc++ cout 误报）
+TSAN_OPTIONS=suppressions=$PWD/tsan.supp ./build-tsan/examples/sync_task
 ```
 
-注意：用 `add_compile_options()` 全局生效，`tests/` 子目录的目标（通过 `add_subdirectory`）会同样带上 flag，无需单独处理。
+注意：用 `add_compile_options()` 全局生效，`tests/`、`examples/` 子目录的目标（通过 `add_subdirectory`）会同样带上 flag，无需单独处理。
 
 ### 2.3 输出解读
 
@@ -91,6 +97,38 @@ WARNING: ThreadSanitizer: data race
 ### 2.4 注意事项
 
 - **冷路径漏报**：TSan 只抓"这次运行确实执行的访问"。没覆盖到的时序/低频分支，跑十次也未必命中。所以测试要**多次、压测**多线程路径，而不是跑一遍就完。
+- **已知误报：libc++ 的 `std::cout`（mac/linux 用 libc++ 时都会遇到）**
+
+  多个线程各自 `std::cout << ... << std::endl`（**没有任何共享数据**）会报：
+
+  ```
+  WARNING: ThreadSanitizer: data race
+    Read of size 8 ... by thread T2:
+      #0 std::__1::__pad_and_output[abi:...]  locale
+    ...
+    Location is global 'std::__1::cout' at 0x... (libc++.dylib+...)
+  ```
+
+  栈顶帧是 `__pad_and_output` 或 `__put_character_sequence` —— 都在 libc++ 内部（fill/pad 缓存的惰性初始化），**不涉及用户数据**。
+  标准保证「对同步的标准 iostream 对象的并发访问不是数据竞争」，这是 TSan 看不到 libc++ 内部同步而导致的误报。
+
+  **本仓提供抑制文件 `tsan.supp`**（**必须用绝对路径**，原因见下方注）：
+
+  ```bash
+  TSAN_OPTIONS=suppressions=$PWD/tsan.supp ./build-tsan/examples/sync_task
+  TSAN_OPTIONS=suppressions=$PWD/tsan.supp ctest --test-dir build-tsan --output-on-failure
+  ```
+
+  > ⚠️ 用相对路径（`suppressions=tsan.supp`）时，直接跑二进制可以（cwd 是仓库根），但 **`ctest` 会全军覆没**：
+  > ctest 在**每个测试自己的目录**（如 `build-tsan/tests/`）下运行测试，相对路径解析不到文件，而 TSan 打不开抑制文件会
+  > **直接报错退出**（`ThreadSanitizer: failed to read suppressions file '...'`），不是忽略而是失败。
+
+  它用 `race_top:`（而非 `race:`）只抑制"**栈顶帧恰好就是这两个 libc++ 函数**"的报告，栈顶帧落在业务/框架代码里的**真实竞争照常报出** ——
+  已验证：故意植入的 `int x` 竞争在开启该抑制文件后**仍然被报出**，而裸 `cout` 的 3 条告警归零。
+
+  不想用抑制文件的话，两条规避路径都已验证干净：改用 `std::printf`，或给输出加锁（串行化）。
+  > 注：本仓 `tests/` 与库本身不打印，故单测在 TSan 下本来就是干净的；
+  > 只有**多线程打印的示例程序**会命中这个误报。
 - **mac 兼容性**：Linux + clang 上最稳；mac 上 AppleClang 也支持 `-fsanitize=thread`，但较新系统存在个别兼容限制（shadow 内存映射类报错）。若在 mac 上遇到 TSan 自身崩溃类问题，改用 Linux 环境验证。
 - **独立构建**：TSan 染色后的产物只用于检测，绝不进发布版本（运行时开销 2~5 倍）。
 - 常用环境变量：`TSAN_OPTIONS=halt_on_error=1`（一报即停）、`exitcode=0`（让测试不因 race 失败，仅打印）。
@@ -210,6 +248,8 @@ clang 的 `-Wthread-safety` 以"编译单元内可见 + 内联"为准，跨边�
 
 ## 5. 推荐策略
 
-1. **现在**：先给 CMake 落地 `ENABLE_TSAN`（见 2.2 方式 B），对现有测试跑多轮 TSan，清掉已存在的竞争。
+1. **现在**：`ENABLE_TSAN` 已落地（见 2.2 方式 B），直接
+   `cmake -S . -B build-tsan -DENABLE_TSAN=ON && cmake --build build-tsan -j && ctest --test-dir build-tsan --output-on-failure`
+   跑多轮，清掉已存在的竞争。
 2. **代码长起来后**：挑 2~3 个「被多线程读写最频繁」的类成员加 `GUARDED_BY` 注解做样板（如 `task_controller` 的 `phase_`/`state_`），并开启 `-Wthread-safety`。
 3. **CI/习惯**：注解当门禁（编译期拦截新错误），TSan 当巡检（每次测试都过一遍）。

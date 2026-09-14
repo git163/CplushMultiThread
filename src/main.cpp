@@ -2,10 +2,12 @@
 // task_runner 框架演示：
 //   1) 同步任务：业务内容 + 协作式停止 + 每秒状态发布
 //   2) 异步任务：内部线程跑同步内容 + async_completion() 完成句柄
-//   3) 防重入：执行/停止各自触发一次错误码分支
+//   3) 自然完成：不调 stop()，任务跑完 on_finished 依然触发
+//   4) 防重入：执行/停止各自触发一次错误码分支
 
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <future>
 #include <iostream>
 #include <memory>
@@ -62,6 +64,12 @@ public:
         std::cout << "  [sync] tick: progress " << done_.load() << "/" << total_ << std::endl;
     }
 
+    // 任务结束回调：三种结束都会触发
+    void on_finished(run_result r, std::exception_ptr e) override {
+        std::cout << "  [sync] on_finished: result=" << to_str(r)
+                  << (e ? " exception" : "") << std::endl;
+    }
+
 private:
     static constexpr int total_ = 100;  // 100 * 50ms ≈ 5s，确保 stop 时仍在执行中被中途打断
     std::atomic<int> done_{0};
@@ -90,10 +98,26 @@ public:
         std::cout << "  [async] tick: progress " << done_.load() << "/" << total_ << std::endl;
     }
 
+    void on_finished(run_result r, std::exception_ptr e) override {
+        std::cout << "  [async] on_finished: result=" << to_str(r)
+                  << (e ? " exception" : "") << std::endl;
+    }
+
 private:
     static constexpr int total_ = 80;
     std::shared_future<void> fut_;
     std::atomic<int> done_{0};
+};
+
+// ===== 演示 3：自然完成（不调用 stop()，on_finished 依然触发）=====
+class quick_job : public runnable_task {
+public:
+    void run(stop_token) override { std::this_thread::sleep_for(300ms); }
+
+    void on_finished(run_result r, std::exception_ptr) override {
+        std::cout << "  [quick] on_finished: result=" << to_str(r)
+                  << "  <- 无人调 stop()，任务跑完自动回调" << std::endl;
+    }
 };
 
 int main() {
@@ -140,6 +164,20 @@ int main() {
     async_stop.join();
 
     std::cout << "  last_run_result:    " << to_str(async_ctl.last_run_result()) << std::endl;
+    std::cout << std::endl;
+
+    // ---- 自然完成 ----
+    std::cout << "[scenario 3] natural completion (no stop() call)" << std::endl;
+    task_controller quick_ctl(std::make_shared<quick_job>(), task_mode::sync, 1s);
+
+    std::cout << "  start():            " << to_str(quick_ctl.start()) << std::endl;
+    for (int i = 0; i < 60 && quick_ctl.running(); ++i) {
+        std::this_thread::sleep_for(20ms);  // 只等，不调 stop()
+    }
+    std::cout << "  running():          " << (quick_ctl.running() ? "true" : "false") << std::endl;
+    std::cout << "  last_run_result:    " << to_str(quick_ctl.last_run_result()) << std::endl;
+    std::cout << "  stop() after idle:  " << to_str(quick_ctl.stop())
+              << "  <- 自然完成后无需再 stop" << std::endl;
     std::cout << std::endl;
 
     std::cout << "== done ==" << std::endl;

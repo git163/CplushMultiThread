@@ -2,8 +2,26 @@
 
 - 日期: 2026-09-04
 - 作者: Claude
-- 状态: 已实施（实现与测试均完成，34/34 用例通过）
+- 状态: 已实施（**快照**：实现与测试均完成，当时 34/34 用例通过）
 - 关联: CplushMultiThread 框架模块 `src/include/task_runner/`
+
+> ⚠️ **本文是 2026-09-04 的实现快照，请以 `src/include/task_runner/README.md` 为准。** 之后的变更见下方「后续变更」。
+
+## 后续变更（本文写完之后）
+
+| 变更 | 说明 | 详见 |
+|---|---|---|
+| 新增任务结束回调 `on_finished` | `runnable_task` 新增虚函数；**三种结束都触发**（completed/stopped/failed），每轮恰好一次，跑在 worker 线程 | `docs/plan-on-finished-callback.md` |
+| 新增 `task_controller::finish_exception()` | 记录 `on_finished` 抛出的首个异常，不影响 `run_result` | 同上 |
+| **`running()==false` 语义收紧** | "置 idle"移到 worker 收尾的**最后一步**（在 `on_finished` 之后），故 `running()==false` 蕴含回调已返回 | 同上 |
+| 析构路径现在**会**触发 `on_finished` | 与 `on_stopped`「析构不触发」不同（任务确实结束了） | 同上 |
+| `start()` 新增自调用防护 | 在控制器自身线程（worker/发布器）内调 `start()` → `self_stop_denied`（原先会 join 自身） | 同上 |
+| `self_stop_denied` 语义扩大 | 从"任务/tick 线程内调 `stop`"扩为"控制器自身线程内调 `start`/`stop`" | 同上 |
+| 用例数 34/43 → **52** | 新增 SC-30~38 覆盖 `on_finished` | `tests/task_runner/TestTaskController.cpp` |
+| 新增使用指南与示例 | 按场景索引的指南 + `examples/` 下 5 个可运行程序 | `docs/task-runner-usage-guide.md`、`examples/README.md` |
+| 新增任务级防重入说明 | 框架的防重入是**控制器**粒度；同一 task 对象被多控制器共享属业务侧竞争 | `docs/task-runner-reentrancy.md` |
+
+> 注：本文 §"组件与公开 API" 中的 `runnable_task` 接口列表、§"替代方案"、§"运行场景 × 状态矩阵"（SC-01~29）仍是对当时实现的准确记录，未回改。
 
 ## 背景
 
