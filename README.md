@@ -71,6 +71,7 @@ lldb ./build/CplushMultiThread           # macOS
 ## 项目结构
 
 - `docs/` — 设计文档、plan 与指南（plan 使用 `docs/plan-template.md`）
+- `docs/ppt/` — 项目汇报 PPT 及其生成脚本（见 `docs/ppt/README.md`）
 - `src/` — 实现（`.cpp`）
 - `src/include/` — 公共头文件（Google C++ 风格）
 - `src/include/task_runner/` — 可执行/可停止任务框架（仅头文件），API 参考见 `src/include/task_runner/README.md`
